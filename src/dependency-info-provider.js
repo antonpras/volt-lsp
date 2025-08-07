@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const Logger = require('./logger');
+const fetch = require('node-fetch'); // **FIX:** Use node-fetch from dependencies
 
 class DependencyInfoProvider {
     constructor(rootPath) {
@@ -33,10 +34,10 @@ class DependencyInfoProvider {
                 const content = fs.readFileSync(this.cacheFile, 'utf8');
                 const cacheData = JSON.parse(content);
                 
-                // Convert plain object back to Map
-                this.cache = new Map(Object.entries(cacheData.dependencies || {}));
-                
-                this.logger.info(`Loaded dependency cache with ${this.cache.size} entries`);
+                if (cacheData && cacheData.dependencies) {
+                    this.cache = new Map(Object.entries(cacheData.dependencies));
+                    this.logger.info(`Loaded dependency cache with ${this.cache.size} entries`);
+                }
             }
         } catch (error) {
             this.logger.error('Failed to load cache:', error);
@@ -46,6 +47,8 @@ class DependencyInfoProvider {
 
     async saveCache() {
         try {
+            if (this.cache.size === 0) return;
+
             const cacheData = {
                 timestamp: Date.now(),
                 dependencies: Object.fromEntries(this.cache)
@@ -77,40 +80,33 @@ class DependencyInfoProvider {
         }
 
         try {
-            // Read the current package.json content
             const content = fs.readFileSync(this.packageJsonPath, 'utf8');
             const lines = content.split('\n');
-            
-            // Get the line at the cursor position
             const currentLine = lines[position.line];
+            
             if (!currentLine) {
                 return null;
             }
 
-            // Extract package name from the line
             const packageName = this.extractPackageNameFromLine(currentLine, position.character);
             if (!packageName) {
                 return null;
             }
 
-            // Check if this is in dependencies or devDependencies section
             if (!this.isInDependenciesSection(lines, position.line)) {
                 return null;
             }
 
-            // Get package information
             const packageInfo = await this.getPackageInfo(packageName);
             if (!packageInfo) {
                 return null;
             }
 
             return {
-                contents: [
-                    {
-                        language: 'markdown',
-                        value: this.formatPackageInfo(packageName, packageInfo)
-                    }
-                ],
+                contents: {
+                    kind: 'markdown',
+                    value: this.formatPackageInfo(packageName, packageInfo)
+                },
                 range: this.getPackageNameRange(currentLine, packageName, position.line)
             };
 
@@ -121,17 +117,16 @@ class DependencyInfoProvider {
     }
 
     extractPackageNameFromLine(line, character) {
-        // Match package name in quotes: "package-name": "version"
-        const match = line.match(/"([^"]+)":\s*"([^"]+)"/);
+        // **FIX:** Improved regex to be more robust
+        const match = line.match(/"([^"]+)"\s*:/);
         if (!match) {
             return null;
         }
 
-        const [, packageName] = match;
+        const packageName = match[1];
         const packageStart = line.indexOf(`"${packageName}"`);
         const packageEnd = packageStart + packageName.length + 2;
 
-        // Check if cursor is over the package name
         if (character >= packageStart && character <= packageEnd) {
             return packageName;
         }
@@ -140,19 +135,19 @@ class DependencyInfoProvider {
     }
 
     isInDependenciesSection(lines, lineNumber) {
-        // Look backwards for dependencies section
+        let inDependencies = false;
         for (let i = lineNumber; i >= 0; i--) {
             const line = lines[i].trim();
             if (line.includes('"dependencies"') || line.includes('"devDependencies"') || 
                 line.includes('"peerDependencies"') || line.includes('"optionalDependencies"')) {
-                return true;
+                inDependencies = true;
+                break;
             }
-            // If we hit another top-level section, stop
-            if (line.match(/^"[^"]+"\s*:\s*{/) && !line.includes('dependencies')) {
-                return false;
+            if (line.match(/^}/) && i < lineNumber) { // End of a block before finding dependencies
+                break;
             }
         }
-        return false;
+        return inDependencies;
     }
 
     getPackageNameRange(line, packageName, lineNumber) {
@@ -162,30 +157,26 @@ class DependencyInfoProvider {
         }
 
         return {
-            start: { line: lineNumber, character: packageStart },
-            end: { line: lineNumber, character: packageStart + packageName.length + 2 }
+            start: { line: lineNumber, character: packageStart + 1 },
+            end: { line: lineNumber, character: packageStart + packageName.length + 1 }
         };
     }
 
     async getPackageInfo(packageName) {
-        // Check cache first
         if (this.cache.has(packageName)) {
             const cachedInfo = this.cache.get(packageName);
-            // Check if cache is not too old (24 hours)
-            if (Date.now() - cachedInfo.timestamp < 24 * 60 * 60 * 1000) {
+            if (Date.now() - (cachedInfo.timestamp || 0) < 24 * 60 * 60 * 1000) {
                 this.logger.debug(`Cache hit for ${packageName}`);
                 return cachedInfo.data;
             }
         }
 
-        // Try to get info from local node_modules first
         const localInfo = await this.getLocalPackageInfo(packageName);
         if (localInfo) {
             this.cachePackageInfo(packageName, localInfo);
             return localInfo;
         }
 
-        // Fallback to npm registry
         const registryInfo = await this.getNpmRegistryInfo(packageName);
         if (registryInfo) {
             this.cachePackageInfo(packageName, registryInfo);
@@ -196,95 +187,58 @@ class DependencyInfoProvider {
     }
 
     async getLocalPackageInfo(packageName) {
-        const packageJsonPaths = [
-            path.join(this.rootPath, 'node_modules', packageName, 'package.json'),
-            path.join(process.cwd(), 'node_modules', packageName, 'package.json')
-        ];
-
-        for (const packageJsonPath of packageJsonPaths) {
-            try {
-                if (fs.existsSync(packageJsonPath)) {
-                    const content = fs.readFileSync(packageJsonPath, 'utf8');
-                    const packageData = JSON.parse(content);
-                    
-                    return {
-                        name: packageData.name,
-                        version: packageData.version,
-                        description: packageData.description,
-                        homepage: packageData.homepage,
-                        repository: packageData.repository,
-                        license: packageData.license,
-                        keywords: packageData.keywords,
-                        author: packageData.author,
-                        source: 'local'
-                    };
-                }
-            } catch (error) {
-                this.logger.debug(`Failed to read local package.json for ${packageName}:`, error.message);
+        const packageJsonPath = path.join(this.rootPath, 'node_modules', packageName, 'package.json');
+        
+        try {
+            if (fs.existsSync(packageJsonPath)) {
+                const content = fs.readFileSync(packageJsonPath, 'utf8');
+                const packageData = JSON.parse(content);
+                
+                return {
+                    name: packageData.name,
+                    version: packageData.version,
+                    description: packageData.description,
+                    homepage: packageData.homepage,
+                    license: packageData.license,
+                    source: 'local'
+                };
             }
+        } catch (error) {
+            this.logger.debug(`Failed to read local package.json for ${packageName}:`, error.message);
         }
-
+        
         return null;
     }
 
     async getNpmRegistryInfo(packageName) {
-        // Only try npm registry if we have internet connection
-        // This is a simplified implementation - in production, you might want to check connectivity first
+        // **FIX:** Replaced manual https request with node-fetch for simplicity and robustness
+        const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}`;
+        this.logger.debug(`Fetching from NPM registry: ${url}`);
+        
         try {
-            const https = require('https');
-            const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}`;
+            const response = await fetch(url, { timeout: 5000 });
+            if (!response.ok) {
+                throw new Error(`NPM registry returned ${response.status} ${response.statusText}`);
+            }
 
-            return new Promise((resolve, reject) => {
-                const timeout = setTimeout(() => {
-                    reject(new Error('Request timeout'));
-                }, 5000);
+            const packageData = await response.json();
+            const latestVersion = packageData['dist-tags']?.latest;
+            const versionData = packageData.versions?.[latestVersion];
 
-                const req = https.get(url, (res) => {
-                    let data = '';
-
-                    res.on('data', (chunk) => {
-                        data += chunk;
-                    });
-
-                    res.on('end', () => {
-                        clearTimeout(timeout);
-                        try {
-                            const packageData = JSON.parse(data);
-                            const latestVersion = packageData['dist-tags']?.latest;
-                            const versionData = packageData.versions?.[latestVersion];
-
-                            if (versionData) {
-                                resolve({
-                                    name: versionData.name,
-                                    version: latestVersion,
-                                    description: versionData.description,
-                                    homepage: versionData.homepage,
-                                    repository: versionData.repository,
-                                    license: versionData.license,
-                                    keywords: versionData.keywords,
-                                    author: versionData.author,
-                                    source: 'npm-registry'
-                                });
-                            } else {
-                                resolve(null);
-                            }
-                        } catch (error) {
-                            reject(error);
-                        }
-                    });
-                });
-
-                req.on('error', (error) => {
-                    clearTimeout(timeout);
-                    reject(error);
-                });
-
-                req.on('timeout', () => {
-                    req.destroy();
-                    reject(new Error('Request timeout'));
-                });
-            });
-
+            if (versionData) {
+                return {
+                    name: versionData.name,
+                    version: latestVersion,
+                    description: versionData.description,
+                    homepage: versionData.homepage,
+                    repository: versionData.repository,
+                    license: versionData.license,
+                    keywords: versionData.keywords,
+                    author: versionData.author,
+                    source: 'npm-registry'
+                };
+            }
+            return null;
         } catch (error) {
             this.logger.debug(`Failed to fetch npm registry info for ${packageName}:`, error.message);
             return null;
@@ -297,8 +251,8 @@ class DependencyInfoProvider {
             data: info
         });
 
-        // Save cache periodically (every 10 packages)
-        if (this.cache.size % 10 === 0) {
+        // Save cache periodically
+        if (this.cache.size % 5 === 0) {
             this.saveCache();
         }
     }
@@ -306,137 +260,30 @@ class DependencyInfoProvider {
     formatPackageInfo(packageName, info) {
         const lines = [];
         
-        lines.push(`# 📦 ${info.name}`);
+        lines.push(`### 📦 ${info.name}`);
         
         if (info.version) {
-            lines.push(`**Version:** ${info.version}`);
+            lines.push(`**Version:** \`${info.version}\``);
         }
 
         if (info.description) {
-            lines.push(`\n**Description:** ${info.description}`);
+            lines.push(`\n${info.description}`);
         }
+        
+        lines.push('---');
 
         if (info.license) {
-            lines.push(`\n**License:** ${info.license}`);
-        }
-
-        if (info.author) {
-            const authorStr = typeof info.author === 'string' ? info.author : 
-                             info.author.name || info.author.email || JSON.stringify(info.author);
-            lines.push(`\n**Author:** ${authorStr}`);
-        }
-
-        if (info.keywords && info.keywords.length > 0) {
-            lines.push(`\n**Keywords:** ${info.keywords.slice(0, 5).join(', ')}${info.keywords.length > 5 ? '...' : ''}`);
+            lines.push(`**License:** ${info.license}`);
         }
 
         if (info.homepage) {
-            lines.push(`\n**Homepage:** ${info.homepage}`);
+            lines.push(`**Homepage:** [${info.homepage}](${info.homepage})`);
         }
-
-        if (info.repository) {
-            const repoUrl = typeof info.repository === 'string' ? info.repository :
-                           info.repository.url || JSON.stringify(info.repository);
-            lines.push(`\n**Repository:** ${repoUrl}`);
-        }
-
-        // Add installation command
-        lines.push(`\n**Install:** \`npm install ${packageName}\``);
-
-        // Add source indicator
+        
         const sourceEmoji = info.source === 'local' ? '💾' : '🌐';
         lines.push(`\n*${sourceEmoji} Source: ${info.source}*`);
 
         return lines.join('\n');
-    }
-
-    async getPackageVersions(packageName) {
-        const cacheKey = `${packageName}:versions`;
-        
-        if (this.cache.has(cacheKey)) {
-            const cachedInfo = this.cache.get(cacheKey);
-            if (Date.now() - cachedInfo.timestamp < 60 * 60 * 1000) { // 1 hour cache
-                return cachedInfo.data;
-            }
-        }
-
-        try {
-            const https = require('https');
-            const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}`;
-
-            const versions = await new Promise((resolve, reject) => {
-                const timeout = setTimeout(() => {
-                    reject(new Error('Request timeout'));
-                }, 5000);
-
-                const req = https.get(url, (res) => {
-                    let data = '';
-
-                    res.on('data', (chunk) => {
-                        data += chunk;
-                    });
-
-                    res.on('end', () => {
-                        clearTimeout(timeout);
-                        try {
-                            const packageData = JSON.parse(data);
-                            const versions = Object.keys(packageData.versions || {});
-                            resolve(versions.slice(-10)); // Last 10 versions
-                        } catch (error) {
-                            reject(error);
-                        }
-                    });
-                });
-
-                req.on('error', (error) => {
-                    clearTimeout(timeout);
-                    reject(error);
-                });
-            });
-
-            this.cache.set(cacheKey, {
-                timestamp: Date.now(),
-                data: versions
-            });
-
-            return versions;
-
-        } catch (error) {
-            this.logger.debug(`Failed to fetch versions for ${packageName}:`, error.message);
-            return [];
-        }
-    }
-
-    async suggestUpdates() {
-        if (!this.packageJson) {
-            return [];
-        }
-
-        const suggestions = [];
-        const dependencies = {
-            ...this.packageJson.dependencies,
-            ...this.packageJson.devDependencies
-        };
-
-        for (const [packageName, currentVersion] of Object.entries(dependencies)) {
-            try {
-                const packageInfo = await this.getPackageInfo(packageName);
-                if (packageInfo && packageInfo.version) {
-                    const cleanCurrentVersion = currentVersion.replace(/^[\^~]/, '');
-                    if (packageInfo.version !== cleanCurrentVersion) {
-                        suggestions.push({
-                            package: packageName,
-                            current: currentVersion,
-                            latest: packageInfo.version
-                        });
-                    }
-                }
-            } catch (error) {
-                this.logger.debug(`Failed to check updates for ${packageName}:`, error.message);
-            }
-        }
-
-        return suggestions;
     }
 }
 

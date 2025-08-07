@@ -14,15 +14,25 @@ class TSServerProxy extends EventEmitter {
         this.pendingRequests = new Map();
         this.buffer = '';
         this.openFiles = new Map();
+        this.isRestarting = false; // **FIX:** Flag to prevent multiple restart attempts
     }
 
     start() {
         this.logger.info('Starting TypeScript server...');
-        
+        this._spawnTSServer();
+    }
+    
+    _spawnTSServer() {
+        if (this.tsserver) { // Clean up existing process if any
+            this.tsserver.kill();
+        }
+
         // Find tsserver executable
         const tsserverPath = this.findTSServer();
         if (!tsserverPath) {
-            throw new Error('TypeScript server not found. Please install typescript package.');
+            this.logger.error('TypeScript server not found. Please install the "typescript" package.');
+            this.emit('error', new Error('TSServer executable not found.'));
+            return;
         }
 
         // Start tsserver process
@@ -30,6 +40,8 @@ class TSServerProxy extends EventEmitter {
             stdio: ['pipe', 'pipe', 'pipe'],
             cwd: this.rootPath
         });
+
+        this.logger.info(`TSServer process started with PID: ${this.tsserver.pid}`);
 
         this.tsserver.stdout.on('data', (data) => {
             this.handleTSServerOutput(data);
@@ -40,13 +52,18 @@ class TSServerProxy extends EventEmitter {
         });
 
         this.tsserver.on('exit', (code) => {
-            this.logger.warn(`TSServer exited with code ${code}`);
+            this.logger.warn(`TSServer exited with code ${code}.`);
+            this.tsserver = null; // Clear the process handle
             this.emit('exit', code);
+            
+            // **FIX:** Attempt to restart the server automatically
+            this._handleUnexpectedExit();
         });
 
         this.tsserver.on('error', (error) => {
-            this.logger.error('TSServer error:', error);
+            this.logger.error('TSServer spawn error:', error);
             this.emit('error', error);
+            this.tsserver = null;
         });
 
         // Configure tsserver
@@ -58,14 +75,41 @@ class TSServerProxy extends EventEmitter {
                 allowTextChangesInNewFiles: true
             }
         });
+
+        // Re-open any files that were open before the crash
+        if (this.isRestarting) {
+            this.logger.info('Re-opening previously opened files...');
+            for (const [uri, content] of this.openFiles.entries()) {
+                this.openFile(uri, content);
+            }
+            this.emit('restarted');
+            this.isRestarting = false;
+        }
     }
+    
+    async _handleUnexpectedExit() {
+        if (this.isRestarting) return; // Already handling a restart
+        
+        this.isRestarting = true;
+        this.emit('restarting');
+        this.logger.warn('TSServer stopped unexpectedly. Attempting to restart in 5 seconds...');
+        
+        // Clear pending requests to avoid timeouts
+        this.pendingRequests.forEach(req => req.reject(new Error('TSServer process exited.')));
+        this.pendingRequests.clear();
+
+        setTimeout(() => {
+            this.logger.info('Restarting TSServer now...');
+            this.start();
+        }, 5000); // 5-second delay before restarting
+    }
+
 
     findTSServer() {
         // Look for tsserver in various locations
         const possiblePaths = [
             path.join(this.rootPath, 'node_modules', 'typescript', 'lib', 'tsserver.js'),
             path.join(__dirname, '..', 'node_modules', 'typescript', 'lib', 'tsserver.js'),
-            path.join(process.cwd(), 'node_modules', 'typescript', 'lib', 'tsserver.js')
         ];
 
         // Also try global installation
@@ -74,8 +118,13 @@ class TSServerProxy extends EventEmitter {
             const globalPath = execSync('npm root -g', { encoding: 'utf8' }).trim();
             possiblePaths.push(path.join(globalPath, 'typescript', 'lib', 'tsserver.js'));
         } catch (error) {
-            // Ignore error
+            this.logger.warn('Could not determine global npm root path.');
         }
+        
+        // Add a final fallback to a common system path for tsserver
+        const globalTsserver = require('fs').existsSync('/usr/lib/node_modules/typescript/lib/tsserver.js') ? '/usr/lib/node_modules/typescript/lib/tsserver.js' : null;
+        if(globalTsserver) possiblePaths.push(globalTsserver);
+
 
         for (const tsserverPath of possiblePaths) {
             if (fs.existsSync(tsserverPath)) {
@@ -90,26 +139,55 @@ class TSServerProxy extends EventEmitter {
     handleTSServerOutput(data) {
         this.buffer += data.toString();
         
-        const lines = this.buffer.split('\n');
-        this.buffer = lines.pop(); // Keep incomplete line in buffer
+        // The tsserver protocol uses two newlines to separate messages
+        const separator = '\r\n\r\n';
+        while(true) {
+            const separatorIndex = this.buffer.indexOf(separator);
+            if (separatorIndex === -1) {
+                break;
+            }
+            
+            const headerPart = this.buffer.substring(0, separatorIndex);
+            const contentLengthMatch = /Content-Length: (\d+)/.exec(headerPart);
 
-        for (const line of lines) {
-            if (line.trim()) {
-                try {
-                    const response = JSON.parse(line);
-                    this.handleTSServerResponse(response);
-                } catch (error) {
-                    this.logger.debug('Non-JSON line from tsserver:', line);
+            if (contentLengthMatch) {
+                const contentLength = parseInt(contentLengthMatch[1], 10);
+                const messageStart = separatorIndex + separator.length;
+                if (this.buffer.length >= messageStart + contentLength) {
+                    const messagePart = this.buffer.substring(messageStart, messageStart + contentLength);
+                    this.buffer = this.buffer.substring(messageStart + contentLength);
+                    try {
+                        const response = JSON.parse(messagePart);
+                        this.handleTSServerResponse(response);
+                    } catch (e) {
+                        this.logger.error('Error parsing TSServer message:', e);
+                    }
+                } else {
+                    break; 
                 }
+            } else {
+                 // Fallback for older tsserver versions that might just use newline
+                const lines = this.buffer.split('\n');
+                this.buffer = lines.pop() || '';
+                for (const line of lines) {
+                    if (line.trim()) {
+                        try {
+                            const response = JSON.parse(line);
+                            this.handleTSServerResponse(response);
+                        } catch (error) {
+                            // This might not be a JSON line, can be ignored
+                        }
+                    }
+                }
+                break;
             }
         }
     }
 
     handleTSServerResponse(response) {
-        this.logger.debug('TSServer response:', JSON.stringify(response, null, 2));
+        // this.logger.debug('TSServer response:', JSON.stringify(response));
 
-        if (response.request_seq !== undefined) {
-            // This is a response to our request
+        if (response.type === 'response') {
             const pendingRequest = this.pendingRequests.get(response.request_seq);
             if (pendingRequest) {
                 this.pendingRequests.delete(response.request_seq);
@@ -121,7 +199,6 @@ class TSServerProxy extends EventEmitter {
                 }
             }
         } else if (response.type === 'event') {
-            // Handle events (like diagnostics)
             this.handleTSServerEvent(response);
         }
     }
@@ -133,9 +210,11 @@ class TSServerProxy extends EventEmitter {
             case 'suggestionDiag':
                 this.handleDiagnosticsEvent(event);
                 break;
-                
+            case 'projectLoadingFinish':
+                this.logger.info('TSServer finished loading project.');
+                break;
             default:
-                this.logger.debug('Unhandled TSServer event:', event.event);
+                // this.logger.debug('Unhandled TSServer event:', event.event);
         }
     }
 
@@ -150,7 +229,7 @@ class TSServerProxy extends EventEmitter {
                     end: { line: diag.end.line - 1, character: diag.end.offset - 1 }
                 },
                 severity: this.mapTSServerSeverity(diag.category),
-                source: 'volt-lsp',
+                source: 'tsserver',
                 message: diag.text,
                 code: diag.code
             }));
@@ -169,6 +248,10 @@ class TSServerProxy extends EventEmitter {
     }
 
     sendTSServerRequest(command, args = {}) {
+        if (!this.tsserver || this.isRestarting) {
+            return Promise.reject(new Error('TSServer is not running or is restarting.'));
+        }
+
         const requestId = ++this.requestId;
         const request = {
             seq: requestId,
@@ -200,12 +283,15 @@ class TSServerProxy extends EventEmitter {
     }
 
     uriToFilePath(uri) {
-        return uri.replace('file://', '');
+        // Handle encoded characters in URI
+        return decodeURIComponent(uri.replace('file://', ''));
     }
 
     filePathToUri(filePath) {
         if (!filePath) return null;
-        return 'file://' + filePath;
+        // Ensure the path is absolute and properly encoded for a URI
+        const absolutePath = path.resolve(filePath);
+        return 'file://' + encodeURI(absolutePath.replace(/\\/g, '/'));
     }
 
     async openFile(uri, content) {
@@ -228,15 +314,12 @@ class TSServerProxy extends EventEmitter {
         const filePath = this.uriToFilePath(uri);
         this.openFiles.set(uri, content);
 
-        await this.sendTSServerRequest('change', {
+        // A more robust way to update is to use 'reload' for full content sync
+        await this.sendTSServerRequest('reload', {
             file: filePath,
-            line: 1,
-            offset: 1,
-            endLine: 1000000,
-            endOffset: 1,
-            insertString: content
+            tmpfile: filePath // Using the same file for simplicity
         });
-
+        
         // Request diagnostics after change
         await this.sendTSServerRequest('geterr', {
             files: [filePath],
@@ -256,10 +339,12 @@ class TSServerProxy extends EventEmitter {
     async getCompletions(uri, position) {
         const filePath = this.uriToFilePath(uri);
         
-        const result = await this.sendTSServerRequest('completions', {
+        const result = await this.sendTSServerRequest('completionInfo', {
             file: filePath,
             line: position.line + 1,
-            offset: position.character + 1
+            offset: position.character + 1,
+            includeExternalModuleExports: true,
+            includeInsertTextCompletions: true
         });
 
         if (!result || !result.entries) {
@@ -270,12 +355,11 @@ class TSServerProxy extends EventEmitter {
             label: entry.name,
             kind: this.mapCompletionItemKind(entry.kind),
             detail: entry.kindModifiers || entry.kind,
-            documentation: entry.documentation ? entry.documentation[0]?.text : undefined,
-            insertText: entry.insertText || entry.name,
-            sortText: entry.sortText
+            sortText: entry.sortText,
+            insertText: entry.name,
         }));
 
-        return { isIncomplete: false, items };
+        return { isIncomplete: !!result.isIncomplete, items };
     }
 
     async getHover(uri, position) {
@@ -292,11 +376,11 @@ class TSServerProxy extends EventEmitter {
         }
 
         const contents = [];
-        if (result.displayString) {
-            contents.push({ language: 'typescript', value: result.displayString });
+        if (result.displayParts) {
+            contents.push({ language: 'typescript', value: result.displayParts.map(p => p.text).join('') });
         }
         if (result.documentation) {
-            contents.push(result.documentation);
+            contents.push(result.documentation.map(d => d.text).join('\n'));
         }
 
         return {
@@ -311,17 +395,17 @@ class TSServerProxy extends EventEmitter {
     async getDefinition(uri, position) {
         const filePath = this.uriToFilePath(uri);
         
-        const result = await this.sendTSServerRequest('definition', {
+        const result = await this.sendTSServerRequest('definitionAndBoundSpan', {
             file: filePath,
             line: position.line + 1,
             offset: position.character + 1
         });
 
-        if (!result || !result.length) {
+        if (!result || !result.definitions || result.definitions.length === 0) {
             return null;
         }
 
-        return result.map(def => ({
+        return result.definitions.map(def => ({
             uri: this.filePathToUri(def.file),
             range: {
                 start: { line: def.start.line - 1, character: def.start.offset - 1 },
@@ -333,35 +417,38 @@ class TSServerProxy extends EventEmitter {
     async getCodeActions(uri, range, context) {
         const filePath = this.uriToFilePath(uri);
         
-        // Get quick fixes
+        const errorCodes = context.diagnostics?.map(d => Number(d.code)).filter(c => !isNaN(c)) || [];
+        if (errorCodes.length === 0) {
+            return [];
+        }
+
         const fixes = await this.sendTSServerRequest('getCodeFixes', {
             file: filePath,
             startLine: range.start.line + 1,
             startOffset: range.start.character + 1,
             endLine: range.end.line + 1,
             endOffset: range.end.character + 1,
-            errorCodes: context.diagnostics?.map(d => d.code).filter(Boolean) || []
+            errorCodes: errorCodes
         });
 
         const actions = [];
-
         if (fixes && fixes.length) {
             for (const fix of fixes) {
                 actions.push({
                     title: fix.description,
                     kind: 'quickfix',
+                    diagnostics: context.diagnostics,
                     edit: this.convertTSServerChangesToWorkspaceEdit(fix.changes)
                 });
             }
         }
-
         return actions;
     }
 
     convertTSServerChangesToWorkspaceEdit(changes) {
         const documentChanges = [];
-
         for (const change of changes) {
+            const uri = this.filePathToUri(change.fileName);
             const textEdits = change.textChanges.map(tc => ({
                 range: {
                     start: { line: tc.start.line - 1, character: tc.start.offset - 1 },
@@ -371,41 +458,33 @@ class TSServerProxy extends EventEmitter {
             }));
 
             documentChanges.push({
-                textDocument: {
-                    uri: this.filePathToUri(change.fileName),
-                    version: null
-                },
+                textDocument: { uri, version: null },
                 edits: textEdits
             });
         }
-
         return { documentChanges };
     }
 
     mapCompletionItemKind(tsKind) {
-        const kindMap = {
-            'class': 7,
-            'constructor': 4,
-            'enum': 13,
-            'field': 5,
-            'file': 17,
-            'function': 3,
-            'interface': 8,
-            'keyword': 14,
-            'let': 6,
-            'local function': 3,
-            'local var': 6,
-            'method': 2,
-            'module': 9,
-            'parameter': 6,
-            'property': 10,
-            'string': 15,
-            'type': 25,
-            'var': 6,
-            'const': 21
+        const LSPCompletionItemKind = {
+            primitive_type: 14,
+            keyword: 14,
+            var: 6,
+            local_var: 6,
+            property: 10,
+            let: 6,
+            const: 21,
+            function: 3,
+            method: 2,
+            class: 7,
+            interface: 8,
+            enum: 13,
+            module: 9,
+            alias: 18,
+            script: 17,
+            type_parameter: 25,
         };
-
-        return kindMap[tsKind] || 1; // Default to Text
+        return LSPCompletionItemKind[tsKind] || 1; // Default to Text
     }
 
     shutdown() {
