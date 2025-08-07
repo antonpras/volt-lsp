@@ -36,10 +36,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/volt-lsp/volt-lsp.git"
+    "url": "https://github.com/antonpras/volt-lsp.git"
   },
   "bugs": {
-    "url": "https://github.com/volt-lsp/volt-lsp/issues"
+    "url": "https://github.com/antonpras/volt-lsp/issues"
   },
-  "homepage": "https://github.com/volt-lsp/volt-lsp#readme"
+  "homepage": "https://github.com/antonpras/volt-lsp#readme"
 }
