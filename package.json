@@ -1,6 +1,6 @@
 {
   "name": "volt-lsp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "The Blazing-Fast, Termux-Native TypeScript Language Server",
   "main": "index.js",
   "bin": {
