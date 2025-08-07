@@ -1,0 +1,45 @@
+{
+  "name": "volt-lsp",
+  "version": "0.2.0",
+  "description": "The Blazing-Fast, Termux-Native TypeScript Language Server",
+  "main": "index.js",
+  "bin": {
+    "volt-lsp": "./bin/volt-lsp"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "jest",
+    "build": "echo 'No build step required for Node.js project'",
+    "dev": "node --inspect index.js"
+  },
+  "keywords": [
+    "lsp",
+    "language-server",
+    "typescript",
+    "javascript",
+    "termux",
+    "android",
+    "mobile-development"
+  ],
+  "author": "Volt LSP Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {
+    "typescript": "^5.0.0",
+    "node-fetch": "^3.3.0",
+    "semver": "^7.5.0"
+  },
+  "devDependencies": {
+    "jest": "^29.5.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/volt-lsp/volt-lsp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/volt-lsp/volt-lsp/issues"
+  },
+  "homepage": "https://github.com/volt-lsp/volt-lsp#readme"
+}
