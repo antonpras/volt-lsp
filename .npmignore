@@ -1,0 +1,14 @@
+.git/
+.github/
+tests/
+test/
+*.test.js
+coverage/
+docs/
+examples/
+.eslintrc*
+.prettierrc*
+*.log
+.volt-lsp-cache.json
+.DS_Store
+Thumbs.db

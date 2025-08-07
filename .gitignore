@@ -1,0 +1,7 @@
+node_modules/
+npm-debug.log*
+*.log
+.npm
+.volt-lsp-cache.json
+.volt-lsp.log
+coverage/
