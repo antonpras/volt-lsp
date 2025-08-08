@@ -275,10 +275,11 @@ class Logger {
 
     // Performance profiling
     profile(name) {
+        const start = Date.now();
         return {
-            start: Date.now(),
+            start,
             end: () => {
-                const duration = Date.now() - this.start;
+                const duration = Date.now() - start;
                 this.debug(`Profile: ${name}`, { duration: `${duration}ms` });
                 return duration;
             }
