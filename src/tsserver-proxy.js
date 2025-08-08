@@ -108,6 +108,52 @@ class TSServerProxy extends EventEmitter {
     async updateFile(uri, content) { await this.sendRequest('change', { file: uri.replace('file://', ''), line: 1, offset: 1, endLine: 100000, endOffset: 1, insertString: content }); }
     async getHover(uri, position) { return this.sendRequest('quickinfo', { file: uri.replace('file://', ''), line: position.line + 1, offset: position.character + 1 }); }
     async getCompletions(uri, position) { return this.sendRequest('completions', { file: uri.replace('file://', ''), line: position.line + 1, offset: position.character + 1 }); }
+
+    async getDefinition(uri, position) {
+        const result = await this.sendRequest('definition', {
+            file: uri.replace('file://', ''),
+            line: position.line + 1,
+            offset: position.character + 1
+        });
+        if (!result) return [];
+        return result.map(def => ({
+            uri: this.filePathToUri(def.file),
+            range: {
+                start: { line: def.start.line - 1, character: def.start.offset - 1 },
+                end: { line: def.end.line - 1, character: def.end.offset - 1 }
+            }
+        }));
+    }
+
+    async getCodeActions(uri, range, context = {}) {
+        const args = {
+            file: uri.replace('file://', ''),
+            startLine: range.start.line + 1,
+            startOffset: range.start.character + 1,
+            endLine: range.end.line + 1,
+            endOffset: range.end.character + 1,
+            errorCodes: (context.diagnostics || [])
+                .map(d => Number(d.code))
+                .filter(code => !isNaN(code))
+        };
+        const result = await this.sendRequest('getCodeFixes', args);
+        if (!result) return [];
+        return result.map(fix => ({
+            title: fix.description,
+            edit: {
+                changes: fix.changes.map(change => ({
+                    textDocument: { uri: this.filePathToUri(change.fileName) },
+                    edits: change.textChanges.map(tc => ({
+                        range: {
+                            start: { line: tc.start.line - 1, character: tc.start.offset - 1 },
+                            end: { line: tc.end.line - 1, character: tc.end.offset - 1 }
+                        },
+                        newText: tc.newText
+                    }))
+                }))
+            }
+        }));
+    }
 }
 
 module.exports = TSServerProxy;
