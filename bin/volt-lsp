@@ -1,8 +1,2 @@
-#!/usr/bin/env node
-
-const path = require('path');
-const VoltLSP = require(path.join(__dirname, '..', 'index.js'));
-
-// Start the Volt LSP server
-const server = new VoltLSP();
-server.start();
+#!/data/data/com.termux/files/usr/bin/node
+require('../index.js');
